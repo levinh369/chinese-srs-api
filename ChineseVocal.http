@@ -1,0 +1,6 @@
+@ChineseVocal_HostAddress = http://localhost:5241
+
+GET {{ChineseVocal_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
