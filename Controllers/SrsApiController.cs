@@ -1,5 +1,4 @@
 ﻿using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc;
@@ -60,6 +59,10 @@ public class SrsApiController : ControllerBase
                 "login" => await LoginAsync(body, ct),
                 "pull" or "sync_pull" or "get_all" => await PullDataAsync(body, ct),
                 "push" or "sync_push" or "sync" => await PushDataAsync(body, ct),
+                "get_account" => await GetAccountAsync(body, ct),
+                "save_account" => await SaveAccountAsync(body, ct),
+                "get_state" => await GetStateAsync(body, ct),
+                "save_state" => await SaveStateAsync(body, ct),
                 _ => BadRequest(new { ok = false, message = $"Action '{action}' không được hỗ trợ." })
             };
         }
@@ -67,6 +70,100 @@ public class SrsApiController : ControllerBase
         {
             return StatusCode(500, new { ok = false, message = $"Lỗi xử lý API: {ex.Message}" });
         }
+    }
+
+    private async Task<IActionResult> GetAccountAsync(JsonElement body, CancellationToken ct)
+    {
+        string key = ExtractKey(body);
+        if (string.IsNullOrWhiteSpace(key))
+            return Ok(new { ok = true, data = (object?)null });
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            "SELECT data_json::text FROM cloud_kv WHERE ns = 'account' AND item_key = @k LIMIT 1", conn);
+        cmd.Parameters.AddWithValue("k", key);
+        var raw = await cmd.ExecuteScalarAsync(ct) as string;
+
+        if (string.IsNullOrWhiteSpace(raw) || raw == "null")
+            return Ok(new { ok = true, data = (object?)null });
+
+        using var doc = JsonDocument.Parse(raw);
+        return Ok(new { ok = true, data = doc.RootElement.Clone() });
+    }
+
+    private async Task<IActionResult> SaveAccountAsync(JsonElement body, CancellationToken ct)
+    {
+        string key = ExtractKey(body);
+        if (string.IsNullOrWhiteSpace(key))
+            return BadRequest(new { ok = false, message = "Thiếu key/userId cho save_account." });
+
+        string payloadJson = ExtractPayloadJson(body);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(@"
+            INSERT INTO cloud_kv (ns, item_key, data_json, updated_at)
+            VALUES ('account', @k, @j::jsonb, @u)
+            ON CONFLICT (ns, item_key) DO UPDATE SET
+                data_json = EXCLUDED.data_json,
+                updated_at = EXCLUDED.updated_at", conn);
+        cmd.Parameters.AddWithValue("k", key);
+        cmd.Parameters.AddWithValue("j", payloadJson);
+        cmd.Parameters.AddWithValue("u", now);
+        await cmd.ExecuteNonQueryAsync(ct);
+
+        return Ok(new { ok = true });
+    }
+
+    private async Task<IActionResult> GetStateAsync(JsonElement body, CancellationToken ct)
+    {
+        string key = ExtractKey(body);
+        if (string.IsNullOrWhiteSpace(key))
+            return Ok(new { ok = true, data = (object?)null });
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(
+            "SELECT data_json::text FROM cloud_kv WHERE ns = 'state' AND item_key = @k LIMIT 1", conn);
+        cmd.Parameters.AddWithValue("k", key);
+        var raw = await cmd.ExecuteScalarAsync(ct) as string;
+
+        if (string.IsNullOrWhiteSpace(raw) || raw == "null")
+            return Ok(new { ok = true, data = (object?)null });
+
+        using var doc = JsonDocument.Parse(raw);
+        return Ok(new { ok = true, data = doc.RootElement.Clone() });
+    }
+
+    private async Task<IActionResult> SaveStateAsync(JsonElement body, CancellationToken ct)
+    {
+        string key = ExtractKey(body);
+        if (string.IsNullOrWhiteSpace(key))
+            return BadRequest(new { ok = false, message = "Thiếu key/userId cho save_state." });
+
+        string payloadJson = ExtractPayloadJson(body);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(@"
+            INSERT INTO cloud_kv (ns, item_key, data_json, updated_at)
+            VALUES ('state', @k, @j::jsonb, @u)
+            ON CONFLICT (ns, item_key) DO UPDATE SET
+                data_json = EXCLUDED.data_json,
+                updated_at = EXCLUDED.updated_at", conn);
+        cmd.Parameters.AddWithValue("k", key);
+        cmd.Parameters.AddWithValue("j", payloadJson);
+        cmd.Parameters.AddWithValue("u", now);
+        await cmd.ExecuteNonQueryAsync(ct);
+
+        return Ok(new { ok = true });
     }
 
     private async Task<IActionResult> RegisterAsync(JsonElement body, CancellationToken ct)
@@ -358,6 +455,14 @@ public class SrsApiController : ControllerBase
                     updated_at BIGINT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS cloud_kv (
+                    ns TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    data_json JSONB NOT NULL DEFAULT 'null'::jsonb,
+                    updated_at BIGINT NOT NULL,
+                    PRIMARY KEY (ns, item_key)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_vocab_words_user_id ON vocab_words(user_id);";
 
             await using var cmd = new NpgsqlCommand(sql, conn);
@@ -369,6 +474,24 @@ public class SrsApiController : ControllerBase
         {
             _schemaLock.Release();
         }
+    }
+
+    private static string ExtractKey(JsonElement body)
+    {
+        string key = GetString(body, "key").Trim();
+        if (!string.IsNullOrWhiteSpace(key)) return key;
+        return GetString(body, "userId").Trim();
+    }
+
+    private static string ExtractPayloadJson(JsonElement body)
+    {
+        if (body.TryGetProperty("payload", out var p) &&
+            p.ValueKind != JsonValueKind.Undefined &&
+            p.ValueKind != JsonValueKind.Null)
+        {
+            return p.GetRawText();
+        }
+        return "{}";
     }
 
     private static string GetString(JsonElement el, string propName)
